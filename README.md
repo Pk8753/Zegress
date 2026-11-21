@@ -397,6 +397,96 @@ Once the air-gap setup is complete, your private Rancher/Kubernetes platform is 
 - Keep sensitive data — patient records, financial data, government or defense information — entirely inside your own network
 - Manage, monitor, and scale your workloads through the Rancher UI
 
+## Offline AI Stack — Reference Setup
+
+Zegress provisions the Rancher/RKE2 platform and a private container registry; it does **not** currently include a specific AI application, AI Kubernetes manifests, or a `docker-compose.ai.yml` file. The stack below is a reference architecture and deployment workflow for adding those workloads.
+
+### Three-Tier Local AI Architecture
+
+| Tier | Component | Role |
+|------|-----------|------|
+| 1. Inference | Ollama with a pinned Qwen model (for example, Qwen 2.5 or Qwen 3) | Local language-model API for application chat and report explanations |
+| 2. Embeddings | BGE-M3 served by Ollama | Multilingual semantic embeddings; BGE-M3 produces 1024-dimensional vectors |
+| 3. Vector storage | Qdrant | Persistent vector search for document chunks; configure the collection for 1024 dimensions and cosine distance |
+
+Use the following application settings as a starting point. `localhost` only works when the application and service share a network namespace. In Docker Compose use service names; in Kubernetes use the services' cluster DNS names.
+
+```bash
+# Example for an app container in Docker Compose
+QWEN_API_BASE="http://ollama:11434"
+QWEN_MODEL_NAME="qwen2.5:<pinned-tag>"  # Or the exact Qwen 3 tag you staged
+QWEN_TIMEOUT=45
+BGE_M3_API_BASE="http://ollama:11434"
+BGE_M3_MODEL_NAME="bge-m3"
+BGE_M3_DIMENSION=1024
+QDRANT_URL="http://qdrant:6333"
+QDRANT_COLLECTION="health_policies"
+```
+
+For an application running in a Kubernetes namespace named `ai`, for example, use service addresses such as `http://ollama.ai.svc.cluster.local:11434` and `http://qdrant.ai.svc.cluster.local:6333`. These are examples: the app, services, collection, and environment-variable names must match your deployment. Do not expose Ollama or Qdrant publicly; configure Qdrant authentication and network restrictions for your environment.
+
+### Prepare and Transfer Everything Before Going Offline
+
+Do not rely on `docker compose up` or `ollama pull` to download anything on an isolated network. Prepare and verify all artifacts on a connected staging machine, then transfer them through your approved offline process. Pin versions and model tags, and confirm their licenses and hardware requirements before production use.
+
+1. On the connected staging machine, download the selected Ollama models. Ollama must be running locally:
+
+   ```bash
+   export QWEN_MODEL='qwen2.5:REPLACE_WITH_PINNED_TAG'  # Or a specific Qwen 3 tag
+   export OLLAMA_IMAGE='ollama/ollama:REPLACE_WITH_PINNED_VERSION'
+   export QDRANT_IMAGE='qdrant/qdrant:REPLACE_WITH_PINNED_VERSION'
+
+   ollama pull "$QWEN_MODEL"
+   ollama pull bge-m3
+   ollama list
+   ```
+
+2. Pull the exact Ollama and Qdrant container image versions that your deployment will use. Save those images and the complete Ollama model cache, including manifests and blobs:
+
+   ```bash
+   export OLLAMA_IMAGE='ollama/ollama:REPLACE_WITH_PINNED_VERSION'
+   export QDRANT_IMAGE='qdrant/qdrant:REPLACE_WITH_PINNED_VERSION'
+
+   docker pull "$OLLAMA_IMAGE"
+   docker pull "$QDRANT_IMAGE"
+   docker save -o ai-stack-images.tar "$OLLAMA_IMAGE" "$QDRANT_IMAGE"
+
+   tar -C "$HOME/.ollama" -czf ollama-models.tar.gz models
+   sha256sum ai-stack-images.tar ollama-models.tar.gz
+   ```
+
+   Replace the `REPLACE_WITH_...` values with concrete versions before running the commands. Record the values for use in the deployment. Keep the checksums with the files and verify them after transfer.
+
+3. Transfer the archives to the registry/bastion host over an approved channel. On that host, load and push the AI container images to the private registry:
+
+   ```bash
+   export OLLAMA_IMAGE='ollama/ollama:REPLACE_WITH_PINNED_VERSION'
+   export QDRANT_IMAGE='qdrant/qdrant:REPLACE_WITH_PINNED_VERSION'
+
+   docker load -i ai-stack-images.tar
+
+   docker login localhost:5000
+   docker tag "$OLLAMA_IMAGE" "localhost:5000/$OLLAMA_IMAGE"
+   docker push "localhost:5000/$OLLAMA_IMAGE"
+
+   docker tag "$QDRANT_IMAGE" "localhost:5000/$QDRANT_IMAGE"
+   docker push "localhost:5000/$QDRANT_IMAGE"
+   ```
+
+   Set `OLLAMA_IMAGE` and `QDRANT_IMAGE` to the same values on the registry host before running these commands. `docker login` prompts for registry credentials; do not put passwords directly in commands or manifests. RKE2 nodes are configured to mirror Docker Hub pulls through the registry's **private IP** on port `5000`. Keep the original `docker.io/ollama/ollama:<pinned-version>` and `docker.io/qdrant/qdrant:<pinned-version>` image references in Kubernetes manifests so the configured mirror can resolve them. `localhost:5000` is for pushing from the registry host; it is not the registry address from a cluster node.
+
+4. Deploy Ollama and Qdrant as Kubernetes workloads with persistent storage. Before serving requests, place the transferred model cache in Ollama's persistent data directory (normally `/root/.ollama` in the container) and verify the models are present with `ollama list`. Mount persistent storage for Qdrant as well. Use `imagePullPolicy: IfNotPresent` and the staged image versions. This repository does not supply these workload manifests or automate model-cache import.
+
+5. Connect your application to the in-cluster service DNS names, create the Qdrant collection with the matching embedding dimensions and distance metric, and test inference and retrieval with non-sensitive sample data. Confirm egress is blocked at the network layer if the deployment must remain offline.
+
+### Embedded, In-Process Alternative
+
+An application can instead bundle its own local embedding, storage, and retrieval components, for example a SQLite-backed vector store and a local inference runtime. This repository does not provide that application or implement an embedded AI engine. NumPy by itself is not a semantic embedding model: meaningful semantic search still requires a local embedding model such as BGE-M3 (or another validated embedding implementation). Persist the database and model files, and test retrieval quality before relying on it.
+
+For healthcare use, treat generated explanations as decision support rather than diagnosis or medical advice. Validate outputs and citations with qualified clinicians and follow applicable privacy, safety, and regulatory requirements.
+
+> **Network boundary:** Zegress prevents the RKE2 cluster nodes from pulling images directly from the public internet by using a private registry. The registry/bastion host is provisioned with internet access to fetch deployment artifacts. For a fully disconnected deployment, stage all required artifacts first and separately enforce and test outbound network denial for every host and workload that must not have egress.
+
 ---
 
 ## Project Structure
@@ -490,23 +580,3 @@ ssh -i ssh-key.pem ubuntu@<registry_public_ip> \
 | `Background push not starting` | Check `logs/push-remaining-images.log` for errors |
 
 ---
-
-## Quick Reference Card
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  DEPLOYMENT CHECKLIST                                            │
-├──────────────────────────────────────────────────────────────────┤
-│  □ terraform, aws, ssh, scp, curl, jq installed                  │
-│  □ ssh-key.pem placed in project root (chmod 400)                │
-│  □ config.tfvars edited with your AWS credentials                │
-│  □ rancher_hostname is a subdomain of your Route53 zone          │
-│  □ rancher_bootstrap_password set to something secure            │
-├──────────────────────────────────────────────────────────────────┤
-│  DEPLOY:    ./deploy.sh                                          │
-│  DESTROY:   ./destroy.sh                                         │
-│  RESUME:    ./deploy.sh  (safe to re-run anytime)                │
-│  LOGS:      ls logs/                                             │
-│  PROGRESS:  tail -f logs/push-remaining-images.log               │
-└──────────────────────────────────────────────────────────────────┘
-```
